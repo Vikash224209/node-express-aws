@@ -1,0 +1,36 @@
+version: '3.9'
+
+services:
+  api:
+    build:
+      context: .
+      target: runtime
+    container_name: node_api
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: development
+    volumes:
+      - ./src:/app/src      # live-reload in dev (remove in prod)
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Uncomment to add a local Postgres instance
+  # db:
+  #   image: postgres:16-alpine
+  #   environment:
+  #     POSTGRES_DB: mydb
+  #     POSTGRES_USER: postgres
+  #     POSTGRES_PASSWORD: changeme
+  #   volumes:
+  #     - pgdata:/var/lib/postgresql/data
+
+# volumes:
+#   pgdata:
+

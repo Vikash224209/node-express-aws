@@ -1,0 +1,129 @@
+// ─── Jenkinsfile (Declarative Pipeline) ──────────────────────────────────────
+// Requires Jenkins plugins: Docker Pipeline, SSH Agent, Credentials Binding
+
+pipeline {
+  agent any
+
+  environment {
+    IMAGE_NAME  = 'node-express-aws'
+    IMAGE_TAG   = "${env.BUILD_NUMBER}"
+    // Set these in Jenkins → Manage Credentials
+    EC2_HOST    = credentials('EC2_HOST')          // e.g. ec2-xx-xx.compute.amazonaws.com
+    EC2_USER    = 'ec2-user'
+    SSH_KEY_ID  = 'ec2-ssh-key'                   // Jenkins SSH credential ID
+    DOCKER_HUB  = credentials('DOCKERHUB_CREDS')  // Docker Hub username/password
+    REPO        = "${DOCKER_HUB_USR}/${IMAGE_NAME}"
+  }
+
+  options {
+    buildDiscarder(logRotator(numToKeepStr: '10'))
+    timeout(time: 30, unit: 'MINUTES')
+    disableConcurrentBuilds()
+  }
+
+  stages {
+
+    // ── 1. Checkout ────────────────────────────────────────────────────
+    stage('Checkout') {
+      steps {
+        checkout scm
+        sh 'git log --oneline -5'
+      }
+    }
+
+    // ── 2. Install & Lint ──────────────────────────────────────────────
+    stage('Install & Lint') {
+      steps {
+        sh '''
+          npm ci
+          npm run lint || true
+        '''
+      }
+    }
+
+    // ── 3. Unit Tests ──────────────────────────────────────────────────
+    stage('Test') {
+      steps {
+        sh 'npm test'
+      }
+      post {
+        always {
+          junit 'coverage/junit.xml'
+          publishHTML(target: [
+            allowMissing: true,
+            reportDir:    'coverage/lcov-report',
+            reportFiles:  'index.html',
+            reportName:   'Coverage Report',
+          ])
+        }
+      }
+    }
+
+    // ── 4. Docker Build ────────────────────────────────────────────────
+    stage('Docker Build') {
+      steps {
+        sh "docker build -t ${REPO}:${IMAGE_TAG} -t ${REPO}:latest ."
+      }
+    }
+
+    // ── 5. Docker Push ─────────────────────────────────────────────────
+    stage('Docker Push') {
+      when { branch 'main' }
+      steps {
+        sh """
+          echo "${DOCKER_HUB_PSW}" | docker login -u "${DOCKER_HUB_USR}" --password-stdin
+          docker push ${REPO}:${IMAGE_TAG}
+          docker push ${REPO}:latest
+        """
+      }
+    }
+
+    // ── 6. Deploy to EC2 ───────────────────────────────────────────────
+    stage('Deploy to EC2') {
+      when { branch 'main' }
+      steps {
+        sshagent(credentials: [SSH_KEY_ID]) {
+          sh """
+            ssh -o StrictHostKeyChecking=no ${EC2_USER}@${EC2_HOST} '
+              set -e
+              echo "Pulling image ${REPO}:${IMAGE_TAG} ..."
+              docker pull ${REPO}:${IMAGE_TAG}
+
+              echo "Stopping old container ..."
+              docker stop node_api || true
+              docker rm   node_api || true
+
+              echo "Starting new container ..."
+              docker run -d \\
+                --name node_api \\
+                --restart unless-stopped \\
+                -p 3000:3000 \\
+                --env-file /home/${EC2_USER}/app/.env \\
+                ${REPO}:${IMAGE_TAG}
+
+              echo "Cleaning up old images ..."
+              docker image prune -f
+            '
+          """
+        }
+      }
+    }
+
+  }
+
+  post {
+    success {
+      echo "✅  Build #${env.BUILD_NUMBER} deployed successfully."
+    }
+    failure {
+      echo "❌  Build #${env.BUILD_NUMBER} failed."
+      // Add Slack/email notification here:
+      // slackSend(channel: '#devops', message: "Build failed: ${env.BUILD_URL}")
+    }
+    always {
+      // Remove local image to free disk space on the Jenkins agent
+      sh "docker rmi ${REPO}:${IMAGE_TAG} || true"
+    }
+  }
+}
+
